@@ -37,7 +37,3 @@ This project demonstrates effective use of **natural language prompts to an AI c
 - **Cursor** (AI coding assistant)
 - **python-dotenv** (secure API key management)
 
----
-
-## 📁 Project Structure
-
