@@ -36,7 +36,7 @@ This project demonstrates effective use of **prompt-driven AI development**, rob
 
 - **Python**
 - **Streamlit** – UI and application state management
-- **OpenAI API** – LLM-based flashcard generation
+- **CHATGPT API** – LLM-based flashcard generation
 - **Cursor** – AI coding assistant used for development
 - **python-dotenv** – Secure API key management
 
