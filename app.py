@@ -74,9 +74,17 @@ if 'quiz_answers' not in st.session_state:
 if 'quiz_scores' not in st.session_state:
     st.session_state.quiz_scores = {}
 
+# Store multiple-choice questions for the quiz (dictionary: index -> mcq data)
+if 'quiz_mcq_questions' not in st.session_state:
+    st.session_state.quiz_mcq_questions = {}
+
 # Track whether the quiz has been completed
 if 'quiz_completed' not in st.session_state:
     st.session_state.quiz_completed = False
+
+# Track whether the quiz has been submitted (for scoring)
+if 'quiz_submitted' not in st.session_state:
+    st.session_state.quiz_submitted = False
 
 # Legacy state variable (kept for compatibility)
 if 'show_answer' not in st.session_state:
@@ -121,10 +129,14 @@ def generate_flashcards(text, num_flashcards=5, max_retries=3):
         )
     
     # Initialize OpenAI client with error handling
+    # If initialization fails, it's likely a configuration issue, not an API key issue
+    # (API key issues usually show up during API calls, not initialization)
     try:
         client = OpenAI(api_key=api_key)
-    except Exception as e:
-        raise ValueError(f"Failed to initialize OpenAI client: {str(e)}")
+    except Exception:
+        # If client initialization fails, treat it as a generation failure
+        # This will show a user-friendly message instead of technical details
+        raise Exception("GENERATION_FAILED")
     
     # Create a detailed prompt that instructs the AI on how to create flashcards
     # The prompt emphasizes quality: no trivial questions, focus on key concepts
@@ -185,11 +197,11 @@ Requirements:
             # Extract the response text from the API response
             # Use safe access with .get() to prevent crashes if response structure is unexpected
             if not response or not response.choices or len(response.choices) == 0:
-                raise ValueError("Empty response from OpenAI API")
+                raise Exception("GENERATION_FAILED")
             
             response_text = response.choices[0].message.content
             if not response_text:
-                raise ValueError("No content in API response")
+                raise Exception("GENERATION_FAILED")
             
             response_text = response_text.strip()
             
@@ -209,29 +221,30 @@ Requirements:
             
             # Validate that we got a list (not a dictionary or other type)
             if not isinstance(flashcards, list):
-                raise ValueError("API response is not a list. Expected a list of flashcards.")
+                raise Exception("GENERATION_FAILED")
             
             # Validate each flashcard has the required structure
             # This prevents crashes if the AI returns malformed data
+            # If validation fails, treat it as a generation failure (show friendly error)
             validated_flashcards = []
             for i, card in enumerate(flashcards):
+                # Validate structure - if any check fails, raise friendly error
                 if not isinstance(card, dict):
-                    raise ValueError(f"Flashcard {i+1} is not a dictionary. Expected a dictionary with 'question' and 'answer' keys.")
+                    raise Exception("GENERATION_FAILED")
                 
                 # Check for required keys
-                if "question" not in card:
-                    raise ValueError(f"Flashcard {i+1} is missing 'question' key.")
-                if "answer" not in card:
-                    raise ValueError(f"Flashcard {i+1} is missing 'answer' key.")
+                if "question" not in card or "answer" not in card:
+                    raise Exception("GENERATION_FAILED")
                 
                 # Ensure question and answer are strings
                 if not isinstance(card.get("question"), str) or not isinstance(card.get("answer"), str):
-                    raise ValueError(f"Flashcard {i+1} has invalid question or answer type. Both must be strings.")
+                    raise Exception("GENERATION_FAILED")
                 
                 # Ensure question and answer are not empty
                 if not card.get("question", "").strip() or not card.get("answer", "").strip():
-                    raise ValueError(f"Flashcard {i+1} has empty question or answer.")
+                    raise Exception("GENERATION_FAILED")
                 
+                # If all validations pass, add to validated list
                 validated_flashcards.append({
                     "question": card["question"].strip(),
                     "answer": card["answer"].strip()
@@ -240,41 +253,29 @@ Requirements:
             # Return the validated flashcards (limit to requested number)
             return validated_flashcards[:num_flashcards]
             
-        except json.JSONDecodeError as e:
+        except json.JSONDecodeError:
             # If JSON parsing fails, wait and retry (exponential backoff)
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt  # Wait 1s, 2s, 4s...
                 time.sleep(wait_time)
                 continue
             else:
-                # All retries failed - provide helpful error message
-                raise ValueError(
-                    f"Failed to parse JSON response after {max_retries} attempts. "
-                    f"The AI may have returned an invalid format. Error: {str(e)}"
-                )
+                # All retries failed - raise a user-friendly exception
+                raise Exception("GENERATION_FAILED")
         
         except Exception as e:
-            # Handle any other unexpected errors
+            # Handle any other unexpected errors (API errors, rate limits, connection issues, etc.)
             if attempt < max_retries - 1:
                 wait_time = 2 ** attempt
                 time.sleep(wait_time)
                 continue
             else:
-                # Provide user-friendly error message
-                error_msg = str(e)
-                if "rate limit" in error_msg.lower():
-                    raise ValueError(
-                        "OpenAI API rate limit exceeded. Please wait a moment and try again."
-                    )
-                elif "authentication" in error_msg.lower() or "api key" in error_msg.lower():
-                    raise ValueError(
-                        "Invalid API key. Please check your OPENAI_API_KEY environment variable."
-                    )
-                else:
-                    raise ValueError(f"Error generating flashcards: {error_msg}")
+                # For any error (rate limits, API errors, connection issues, etc.), 
+                # raise a generic user-friendly exception
+                raise Exception("GENERATION_FAILED")
     
     # Should not reach here, but included as a safety net
-    raise ValueError(f"Failed to generate flashcards after {max_retries} attempts. Please try again.")
+    raise Exception("GENERATION_FAILED")
 
 
 def calculate_answer_similarity(user_answer, correct_answer):
@@ -374,6 +375,205 @@ def calculate_answer_similarity(user_answer, correct_answer):
     
     return combined_similarity, is_correct, matched_keywords
 
+
+def generate_multiple_choice_questions(flashcards, max_retries=3):
+    """
+    Convert flashcards into multiple-choice questions with 4 options each.
+    
+    This function uses an LLM to convert Q&A flashcards into multiple-choice format
+    with exactly 4 options (A, B, C, D) where only one is correct.
+    
+    Args:
+        flashcards (list): List of flashcard dictionaries with 'question' and 'answer' keys
+        max_retries (int): Maximum number of retry attempts if JSON parsing fails (default: 3)
+    
+    Returns:
+        dict: Dictionary mapping index to MCQ data with structure:
+            {
+                'question': str,
+                'options': {'A': str, 'B': str, 'C': str, 'D': str},
+                'correct_answer': str (one of 'A', 'B', 'C', 'D')
+            }
+    
+    Raises:
+        Exception: If generation fails after all retries
+    """
+    # Validate inputs
+    if not flashcards or not isinstance(flashcards, list) or len(flashcards) == 0:
+        raise Exception("GENERATION_FAILED")
+    
+    # Check for API key
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY environment variable is not set.")
+    
+    try:
+        client = OpenAI(api_key=api_key)
+    except Exception:
+        raise Exception("GENERATION_FAILED")
+    
+    # Prepare flashcards data for the prompt
+    flashcards_text = ""
+    for i, card in enumerate(flashcards):
+        flashcards_text += f"Flashcard {i+1}:\n"
+        flashcards_text += f"Question: {card.get('question', '')}\n"
+        flashcards_text += f"Answer: {card.get('answer', '')}\n\n"
+    
+    # Create prompt for multiple-choice question generation
+    prompt = f"""You are an educational assistant that converts flashcards into multiple-choice questions.
+
+Flashcards to convert:
+{flashcards_text}
+
+For each flashcard, create a multiple-choice question with exactly 4 options (A, B, C, D).
+
+REQUIREMENTS:
+- Convert the question into a clear multiple-choice format
+- Provide exactly 4 answer options labeled A, B, C, D
+- Only ONE option must be correct (the correct answer from the flashcard)
+- The other 3 options must be plausible but clearly wrong distractors
+- Distractors should be related to the topic but incorrect
+- Clearly indicate which option (A, B, C, or D) is the correct answer
+
+IMPORTANT: Return ONLY valid JSON in this exact format (no markdown, no code blocks, no additional text):
+[
+  {{
+    "question": "The converted multiple-choice question text",
+    "options": {{
+      "A": "First option text",
+      "B": "Second option text",
+      "C": "Third option text",
+      "D": "Fourth option text"
+    }},
+    "correct_answer": "A"
+  }},
+  {{
+    "question": "...",
+    "options": {{"A": "...", "B": "...", "C": "...", "D": "..."}},
+    "correct_answer": "B"
+  }}
+]
+
+Requirements:
+- Return exactly {len(flashcards)} multiple-choice questions (one per flashcard)
+- Each question must have exactly 4 options (A, B, C, D)
+- correct_answer must be exactly one of: "A", "B", "C", or "D"
+- Return ONLY the JSON array, nothing else"""
+    
+    # Retry logic for JSON parsing
+    for attempt in range(max_retries):
+        try:
+            # Call OpenAI API
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "You are a helpful assistant that returns only valid JSON. Never include markdown code blocks or additional text."
+                    },
+                    {
+                        "role": "user",
+                        "content": prompt
+                    }
+                ],
+                temperature=0.7,
+                max_tokens=3000
+            )
+            
+            # Extract response
+            if not response or not response.choices or len(response.choices) == 0:
+                raise Exception("GENERATION_FAILED")
+            
+            response_text = response.choices[0].message.content
+            if not response_text:
+                raise Exception("GENERATION_FAILED")
+            
+            response_text = response_text.strip()
+            
+            # Remove markdown code blocks if present
+            if response_text.startswith("```json"):
+                response_text = response_text[7:]
+            elif response_text.startswith("```"):
+                response_text = response_text[3:]
+            if response_text.endswith("```"):
+                response_text = response_text[:-3]
+            response_text = response_text.strip()
+            
+            # Parse JSON
+            mcq_list = json.loads(response_text)
+            
+            # Validate structure
+            if not isinstance(mcq_list, list):
+                raise Exception("GENERATION_FAILED")
+            
+            if len(mcq_list) != len(flashcards):
+                raise Exception("GENERATION_FAILED")
+            
+            # Validate and convert to dictionary format
+            mcq_dict = {}
+            for idx, mcq in enumerate(mcq_list):
+                try:
+                    # Validate required fields
+                    if not isinstance(mcq, dict):
+                        raise Exception("GENERATION_FAILED")
+                    
+                    if "question" not in mcq or "options" not in mcq or "correct_answer" not in mcq:
+                        raise Exception("GENERATION_FAILED")
+                    
+                    # Validate options structure
+                    options = mcq["options"]
+                    if not isinstance(options, dict):
+                        raise Exception("GENERATION_FAILED")
+                    
+                    # Ensure all 4 options exist
+                    required_options = ["A", "B", "C", "D"]
+                    if not all(opt in options for opt in required_options):
+                        raise Exception("GENERATION_FAILED")
+                    
+                    # Validate correct_answer
+                    correct = mcq["correct_answer"]
+                    if correct not in required_options:
+                        raise Exception("GENERATION_FAILED")
+                    
+                    # Validate all are strings
+                    if not isinstance(mcq["question"], str) or not all(isinstance(options[opt], str) for opt in required_options):
+                        raise Exception("GENERATION_FAILED")
+                    
+                    # Store in dictionary
+                    mcq_dict[idx] = {
+                        "question": mcq["question"].strip(),
+                        "options": {
+                            "A": options["A"].strip(),
+                            "B": options["B"].strip(),
+                            "C": options["C"].strip(),
+                            "D": options["D"].strip()
+                        },
+                        "correct_answer": correct
+                    }
+                except Exception:
+                    raise Exception("GENERATION_FAILED")
+            
+            return mcq_dict
+            
+        except json.JSONDecodeError:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+                continue
+            else:
+                raise Exception("GENERATION_FAILED")
+        
+        except Exception:
+            if attempt < max_retries - 1:
+                wait_time = 2 ** attempt
+                time.sleep(wait_time)
+                continue
+            else:
+                raise Exception("GENERATION_FAILED")
+    
+    raise Exception("GENERATION_FAILED")
+
+
 # ============================================================================
 # MAIN APPLICATION
 # ============================================================================
@@ -382,7 +582,7 @@ def main():
     """
     Main application function that handles the UI and user interactions.
     
-    This function creates the Streamlit interface with three main sections:
+    This function creates the Streamlit 🗂️interface with three main sections:
     1. Generate Flashcards - Create new flashcards from study material
     2. Review Flashcards - Review existing flashcards
     3. Quiz Mode - Take a quiz on flashcards
@@ -467,6 +667,30 @@ def main():
                             else:
                                 # Store flashcards in session state
                                 st.session_state.flashcards = new_flashcards
+                                
+                                # RESET ALL QUIZ-RELATED STATE when new flashcards are generated
+                                # This ensures Quiz Mode starts fresh with the new flashcards
+                                st.session_state.quiz_mode = False
+                                st.session_state.quiz_flashcards = []  # Clear selected quiz flashcards
+                                st.session_state.quiz_mcq_questions = {}  # Clear generated MCQ questions
+                                st.session_state.current_quiz_index = 0  # Reset to first question
+                                st.session_state.quiz_answers = {}  # Clear all user answers
+                                st.session_state.quiz_scores = {}  # Clear all scores
+                                st.session_state.quiz_completed = False  # Reset completion status
+                                st.session_state.quiz_submitted = False  # Reset submission status
+                                
+                                # Clear any per-question answer selection state
+                                # Remove all keys that start with "selected_answer_" or "option_"
+                                keys_to_remove = [
+                                    key for key in st.session_state.keys()
+                                    if key.startswith("selected_answer_") or 
+                                       key.startswith("option_") or
+                                       key.startswith("radio_") or
+                                       key.startswith("select_")
+                                ]
+                                for key in keys_to_remove:
+                                    del st.session_state[key]
+                                
                                 st.success(
                                     f"✅ Successfully generated {len(new_flashcards)} flashcards!"
                                 )
@@ -484,7 +708,7 @@ def main():
                                         st.error(f"Error displaying flashcard {i}: {str(e)}")
                     
                     except ValueError as e:
-                        # Handle API key missing or JSON parsing errors
+                        # Handle API key missing - this is the only technical error we show
                         error_message = str(e)
                         if "OPENAI_API_KEY" in error_message or "API key" in error_message:
                             st.error("""
@@ -513,20 +737,47 @@ def main():
                             ```
                             """)
                         else:
-                            st.error(f"⚠️ Error generating flashcards: {error_message}")
-                            st.info(
-                                "💡 Tip: Try generating again. The AI may have returned "
-                                "an invalid response format. If the problem persists, "
-                                "try with shorter study material."
-                            )
+                            # For other ValueError cases, show user-friendly message
+                            st.info("""
+                            ⚠️ **Unable to Generate Flashcards**
+                            
+                            We're unable to generate flashcards at the moment. This might be due to:
+                            - The service is temporarily unavailable
+                            - Your input needs adjustment
+                            
+                            **What you can try:**
+                            - Wait a moment and try again
+                            - Edit your study material (try making it shorter or more focused)
+                            - Check that your study material contains enough content
+                            """)
                     
                     except Exception as e:
-                        # Handle any other unexpected errors
-                        st.error(f"⚠️ An unexpected error occurred: {str(e)}")
-                        st.info(
-                            "💡 Please try again or check your API key and internet connection. "
-                            "If the problem persists, try refreshing the page."
-                        )
+                        # Handle all other errors (API errors, rate limits, connection issues, etc.)
+                        # Show a calm, user-friendly message without technical details
+                        if str(e) == "GENERATION_FAILED":
+                            # This is our custom exception for user-friendly errors
+                            st.info("""
+                            ⚠️ **Unable to Generate Flashcards**
+                            
+                            We're unable to generate flashcards at the moment. This might be temporary.
+                            
+                            **What you can try:**
+                            - Wait a few moments and try again
+                            - Edit your study material (try making it shorter or more focused)
+                            - Ensure your study material contains clear, complete information
+                            """)
+                        else:
+                            # Catch any other unexpected exceptions with the same friendly message
+                            st.info("""
+                            ⚠️ **Unable to Generate Flashcards**
+                            
+                            We're unable to generate flashcards at the moment. This might be temporary.
+                            
+                            **What you can try:**
+                            - Wait a few moments and try again
+                            - Edit your study material (try making it shorter or more focused)
+                            - Ensure your study material contains clear, complete information
+                            """)
             
             # Display current flashcards count (if any exist)
             if st.session_state.flashcards:
@@ -659,12 +910,52 @@ def main():
                                         # Store selected flashcards
                                         st.session_state.quiz_flashcards = selected_flashcards
                                         
+                                        # Generate multiple-choice questions from flashcards
+                                        with st.spinner("Generating multiple-choice questions... This may take a few seconds."):
+                                            try:
+                                                mcq_questions = generate_multiple_choice_questions(selected_flashcards)
+                                                st.session_state.quiz_mcq_questions = mcq_questions
+                                            except ValueError as e:
+                                                # API key error - show setup instructions
+                                                error_message = str(e)
+                                                if "OPENAI_API_KEY" in error_message or "API key" in error_message:
+                                                    st.error("""
+                                                    🔑 **API Key Missing or Invalid**
+                                                    
+                                                    Please set your OpenAI API key to generate quiz questions.
+                                                    """)
+                                                    return
+                                                else:
+                                                    st.info("""
+                                                    ⚠️ **Unable to Generate Quiz Questions**
+                                                    
+                                                    We're unable to generate quiz questions at the moment.
+                                                    
+                                                    **What you can try:**
+                                                    - Wait a few moments and try again
+                                                    - Check your API key configuration
+                                                    """)
+                                                    return
+                                            except Exception:
+                                                # Any other error - show friendly message
+                                                st.info("""
+                                                ⚠️ **Unable to Generate Quiz Questions**
+                                                
+                                                We're unable to generate quiz questions at the moment. This might be temporary.
+                                                
+                                                **What you can try:**
+                                                - Wait a few moments and try again
+                                                - Try with fewer flashcards
+                                                """)
+                                                return
+                                        
                                         # Initialize quiz state
                                         st.session_state.quiz_mode = True
                                         st.session_state.current_quiz_index = 0
-                                        st.session_state.quiz_answers = {}
-                                        st.session_state.quiz_scores = {}
+                                        st.session_state.quiz_answers = {}  # Will store selected option (A, B, C, or D)
+                                        st.session_state.quiz_scores = {}  # Will store is_correct boolean
                                         st.session_state.quiz_completed = False
+                                        st.session_state.quiz_submitted = False  # Track if quiz has been submitted
                                         st.rerun()
                             
                             except Exception as e:
@@ -676,21 +967,24 @@ def main():
                 
                 # Quiz in progress or completed
                 else:
-                    # Handle edge case: quiz_flashcards might be empty or invalid
+                    # Safety check: If flashcards have changed (new flashcards generated),
+                    # automatically reset quiz state to prevent stale data
                     if (not st.session_state.quiz_flashcards or
-                            len(st.session_state.quiz_flashcards) == 0):
-                        st.warning("⚠️ Quiz data not found. Please start a new quiz.")
-                        if st.button("🔄 Reset Quiz"):
-                            try:
-                                st.session_state.quiz_mode = False
-                                st.session_state.quiz_flashcards = []
-                                st.session_state.current_quiz_index = 0
-                                st.session_state.quiz_answers = {}
-                                st.session_state.quiz_scores = {}
-                                st.session_state.quiz_completed = False
-                                st.rerun()
-                            except Exception as e:
-                                st.error(f"Error resetting quiz: {str(e)}")
+                            len(st.session_state.quiz_flashcards) == 0 or
+                            not st.session_state.quiz_mcq_questions or
+                            len(st.session_state.quiz_mcq_questions) == 0):
+                        # Quiz data is missing or invalid - reset quiz mode
+                        st.warning("⚠️ Quiz data not found or flashcards have been updated. Please start a new quiz.")
+                        # Auto-reset quiz state
+                        st.session_state.quiz_mode = False
+                        st.session_state.quiz_flashcards = []
+                        st.session_state.quiz_mcq_questions = {}
+                        st.session_state.current_quiz_index = 0
+                        st.session_state.quiz_answers = {}
+                        st.session_state.quiz_scores = {}
+                        st.session_state.quiz_completed = False
+                        st.session_state.quiz_submitted = False
+                        st.rerun()
                     
                     # Quiz is active
                     else:
@@ -708,6 +1002,16 @@ def main():
                             
                             # Quiz in progress (not completed)
                             if not st.session_state.quiz_completed and current_index < total_flashcards:
+                                # Check if MCQ questions are available
+                                if not st.session_state.quiz_mcq_questions or current_index not in st.session_state.quiz_mcq_questions:
+                                    st.error("Quiz questions not available. Please start a new quiz.")
+                                    if st.button("🔄 Reset Quiz"):
+                                        st.session_state.quiz_mode = False
+                                        st.session_state.quiz_completed = False
+                                        st.session_state.quiz_submitted = False
+                                        st.rerun()
+                                    return
+                                
                                 # Progress bar
                                 try:
                                     progress = (current_index + 1) / total_flashcards
@@ -716,17 +1020,19 @@ def main():
                                 except Exception:
                                     pass  # Silently handle progress bar errors
                                 
-                                # Get current flashcard safely
+                                # Get current multiple-choice question
                                 try:
-                                    current_card = st.session_state.quiz_flashcards[current_index]
-                                    question = current_card.get('question', 'No question available')
-                                    answer = current_card.get('answer', 'No answer available')
-                                except (IndexError, KeyError, TypeError) as e:
+                                    mcq = st.session_state.quiz_mcq_questions[current_index]
+                                    question = mcq.get('question', 'No question available')
+                                    options = mcq.get('options', {})
+                                    correct_answer = mcq.get('correct_answer', '')
+                                except (KeyError, TypeError) as e:
                                     st.error(f"Error loading question {current_index + 1}: {str(e)}")
                                     st.info("💡 Please reset the quiz and try again.")
                                     if st.button("🔄 Reset Quiz"):
                                         st.session_state.quiz_mode = False
                                         st.session_state.quiz_completed = False
+                                        st.session_state.quiz_submitted = False
                                         st.rerun()
                                     return
                                 
@@ -734,162 +1040,155 @@ def main():
                                 st.markdown("### Question:")
                                 st.info(question)
                                 
-                                # Answer input area
-                                user_answer_key = f"user_answer_{current_index}"
-                                if user_answer_key not in st.session_state:
-                                    st.session_state[user_answer_key] = ""
+                                # Initialize answer selection state - start with None (no selection)
+                                answer_key = f"selected_answer_{current_index}"
+                                if answer_key not in st.session_state:
+                                    st.session_state[answer_key] = None
                                 
-                                user_answer = st.text_area(
-                                    "Your Answer:",
-                                    key=f"answer_input_{current_index}",
-                                    height=150,
-                                    placeholder="Type your answer here..."
-                                )
+                                # Get previously selected answer (if any) - this preserves selection when navigating
+                                previous_selection = st.session_state.get(answer_key)
+                                
+                                # Display multiple-choice options as clickable buttons
+                                # This gives us full control - no option is pre-selected
+                                st.markdown("**Select your answer:**")
+                                
+                                # Create buttons for each option in a clean layout
+                                option_cols = st.columns(4)
+                                selected_option = None
+                                
+                                # Display each option as a button
+                                # Disable buttons if quiz has been submitted
+                                for idx, opt in enumerate(["A", "B", "C", "D"]):
+                                    with option_cols[idx]:
+                                        # Highlight button if this was previously selected
+                                        button_type = "primary" if previous_selection == opt else "secondary"
+                                        button_label = f"**{opt}**\n\n{options.get(opt, '')}"
+                                        
+                                        if st.button(
+                                            button_label,
+                                            key=f"option_{current_index}_{opt}",
+                                            use_container_width=True,
+                                            type=button_type,
+                                            disabled=st.session_state.quiz_submitted  # Lock after submission
+                                        ):
+                                            # User clicked this option
+                                            selected_option = opt
+                                
+                                # Process selection only if user clicked a button and quiz is not submitted
+                                if selected_option is not None and not st.session_state.quiz_submitted:
+                                    # Update state when user actively selects an option
+                                    if selected_option != st.session_state.get(answer_key):
+                                        st.session_state[answer_key] = selected_option
+                                        st.session_state.quiz_answers[current_index] = selected_option
+                                        st.rerun()  # Rerun to update UI
+                                
+                                # Show status message
+                                if st.session_state.quiz_submitted:
+                                    # Quiz is submitted - show if answer was correct/incorrect
+                                    if previous_selection is not None:
+                                        is_correct = (previous_selection == correct_answer)
+                                        if is_correct:
+                                            st.success("✅ Correct!")
+                                        else:
+                                            st.error(f"❌ Incorrect. The correct answer is {correct_answer}.")
+                                    else:
+                                        st.warning("⚠️ This question was not answered.")
+                                elif previous_selection is None:
+                                    # No answer selected yet (quiz not submitted)
+                                    st.info("👆 Click one of the options above to select your answer.")
+                                else:
+                                    # Answer selected but quiz not submitted yet
+                                    st.info(f"Selected: **{previous_selection}** (Click 'Submit Quiz' when done to see results)")
                                 
                                 # Navigation buttons
                                 col1, col2, col3 = st.columns([1, 1, 1])
                                 
                                 # Previous button
                                 with col1:
-                                    if st.button("⏮️ Previous", disabled=(current_index == 0)):
+                                    if st.button("⏮️ Previous", disabled=(current_index == 0 or st.session_state.quiz_submitted)):
                                         if current_index > 0:
                                             st.session_state.current_quiz_index -= 1
                                             st.rerun()
                                 
-                                # Submit Answer button
+                                # Next button or Submit Quiz button
                                 with col2:
-                                    if st.button("✅ Submit Answer"):
-                                        try:
-                                            # Save answer
-                                            st.session_state.quiz_answers[current_index] = user_answer
-                                            st.session_state[user_answer_key] = user_answer
+                                    # Show "Submit Quiz" on last question, "Next" otherwise
+                                    if current_index == total_flashcards - 1:
+                                        # Last question - show Submit Quiz button
+                                        if st.button("✅ Submit Quiz", type="primary", use_container_width=True, disabled=st.session_state.quiz_submitted):
+                                            # Calculate and store scores
+                                            st.session_state.quiz_submitted = True
                                             
-                                            # Score the answer
-                                            similarity, is_correct, keywords = calculate_answer_similarity(
-                                                user_answer, answer
-                                            )
-                                            st.session_state.quiz_scores[current_index] = {
-                                                'similarity': similarity,
-                                                'is_correct': is_correct,
-                                                'keywords': keywords
-                                            }
+                                            # Score all answers
+                                            for idx in range(total_flashcards):
+                                                try:
+                                                    selected_option = st.session_state.quiz_answers.get(idx, None)
+                                                    
+                                                    if idx not in st.session_state.quiz_mcq_questions:
+                                                        continue
+                                                    
+                                                    mcq = st.session_state.quiz_mcq_questions[idx]
+                                                    correct_option = mcq.get('correct_answer', '')
+                                                    
+                                                    # Score: 1 point if correct, 0 if incorrect or unanswered
+                                                    is_correct = (selected_option == correct_option) if selected_option is not None else False
+                                                    st.session_state.quiz_scores[idx] = {
+                                                        'is_correct': is_correct
+                                                    }
+                                                except Exception:
+                                                    continue
                                             
-                                            # Show feedback
-                                            if is_correct:
-                                                st.success(f"✅ Answer saved! Similarity: {similarity:.1%}")
-                                            else:
-                                                st.warning(f"⚠️ Answer saved. Similarity: {similarity:.1%}")
-                                        except Exception as e:
-                                            st.error(f"Error scoring answer: {str(e)}")
+                                            st.session_state.quiz_completed = True
+                                            st.rerun()
+                                    else:
+                                        # Not last question - show Next button
+                                        if st.button("⏭️ Next", use_container_width=True, disabled=st.session_state.quiz_submitted):
+                                            # Move to next question
+                                            st.session_state.current_quiz_index += 1
+                                            st.rerun()
                                 
-                                # Next button
+                                # Show correct answer only after submission
                                 with col3:
-                                    if st.button("⏭️ Next"):
-                                        try:
-                                            # Save current answer if not already saved
-                                            if current_index not in st.session_state.quiz_answers:
-                                                st.session_state.quiz_answers[current_index] = user_answer
-                                                st.session_state[user_answer_key] = user_answer
-                                                
-                                                # Score the answer
-                                                similarity, is_correct, keywords = calculate_answer_similarity(
-                                                    user_answer, answer
-                                                )
-                                                st.session_state.quiz_scores[current_index] = {
-                                                    'similarity': similarity,
-                                                    'is_correct': is_correct,
-                                                    'keywords': keywords
-                                                }
-                                            
-                                            # Move to next question or complete quiz
-                                            if current_index < total_flashcards - 1:
-                                                st.session_state.current_quiz_index += 1
-                                                st.rerun()
-                                            else:
-                                                # Quiz completed
-                                                st.session_state.quiz_completed = True
-                                                st.rerun()
-                                        except Exception as e:
-                                            st.error(f"Error moving to next question: {str(e)}")
-                                
-                                # Optional: Show correct answer checkbox
-                                if st.checkbox("Show Correct Answer", key=f"show_correct_{current_index}"):
-                                    st.markdown("**Correct Answer:**")
-                                    st.success(answer)
-                                    
-                                    # Show scoring info if answer was submitted
-                                    if current_index in st.session_state.quiz_scores:
-                                        try:
-                                            score_info = st.session_state.quiz_scores[current_index]
-                                            similarity = score_info.get('similarity', 0)
-                                            is_correct = score_info.get('is_correct', False)
-                                            status = '✅ Correct' if is_correct else '❌ Needs Improvement'
-                                            st.caption(f"Similarity: {similarity:.1%} | Status: {status}")
-                                        except Exception:
-                                            pass
+                                    if st.session_state.quiz_submitted:
+                                        st.caption(f"Correct: **{correct_answer}**")
+                                    else:
+                                        st.caption("Answer all questions, then click 'Submit Quiz'")
                             
-                            # Quiz completed - show results
-                            elif st.session_state.quiz_completed:
+                            # Quiz completed - show results after submission
+                            elif st.session_state.quiz_completed and st.session_state.quiz_submitted:
                                 st.balloons()  # Celebration animation
-                                st.success("🎉 Quiz Completed!")
+                                st.success("🎉 Quiz Submitted!")
                                 
                                 try:
-                                    # Calculate final score
+                                    # Calculate final score from stored scores
                                     total = len(st.session_state.quiz_flashcards)
                                     correct_count = 0
                                     incorrect_answers = []
                                     
-                                    # Score all answers that weren't scored during quiz
+                                    # Count correct/incorrect from stored scores
                                     for idx in range(total):
                                         try:
-                                            # Get user answer safely
-                                            user_ans = st.session_state.quiz_answers.get(idx, "")
-                                            
-                                            # Get flashcard safely
-                                            if idx >= len(st.session_state.quiz_flashcards):
-                                                continue
-                                            card = st.session_state.quiz_flashcards[idx]
-                                            correct_ans = card.get('answer', '')
-                                            
-                                            # Score if not already scored
-                                            if idx not in st.session_state.quiz_scores:
-                                                similarity, is_correct, keywords = calculate_answer_similarity(
-                                                    user_ans, correct_ans
-                                                )
-                                                st.session_state.quiz_scores[idx] = {
-                                                    'similarity': similarity,
-                                                    'is_correct': is_correct,
-                                                    'keywords': keywords
-                                                }
-                                            
-                                            # Count correct/incorrect
                                             score_info = st.session_state.quiz_scores.get(idx, {})
                                             if score_info.get('is_correct', False):
                                                 correct_count += 1
                                             else:
-                                                incorrect_answers.append({
-                                                    'index': idx,
-                                                    'card': card,
-                                                    'user_answer': user_ans,
-                                                    'similarity': score_info.get('similarity', 0)
-                                                })
-                                        except Exception as e:
-                                            # If one answer fails, continue with others
-                                            st.warning(f"Error processing answer {idx + 1}: {str(e)}")
+                                                # Get question data for review
+                                                if idx in st.session_state.quiz_mcq_questions:
+                                                    mcq = st.session_state.quiz_mcq_questions[idx]
+                                                    selected_option = st.session_state.quiz_answers.get(idx, None)
+                                                    incorrect_answers.append({
+                                                        'index': idx,
+                                                        'mcq': mcq,
+                                                        'selected_option': selected_option
+                                                    })
+                                        except Exception:
                                             continue
                                     
-                                    # Display final score metrics
-                                    try:
-                                        percentage = (correct_count / total * 100) if total > 0 else 0
-                                        col1, col2, col3 = st.columns(3)
-                                        with col1:
-                                            st.metric("Correct Answers", f"{correct_count}/{total}")
-                                        with col2:
-                                            st.metric("Score", f"{percentage:.1f}%")
-                                        with col3:
-                                            st.metric("Incorrect", len(incorrect_answers))
-                                    except Exception:
-                                        pass
+                                    # Display final score - simple format: "Final Score: X / N"
+                                    st.markdown("---")
+                                    percentage = (correct_count / total * 100) if total > 0 else 0
+                                    st.markdown(f"## Final Score: **{correct_count} / {total}** ({percentage:.1f}%)")
+                                    st.markdown("---")
                                     
                                     # Show review of incorrect answers
                                     if incorrect_answers:
@@ -902,29 +1201,33 @@ def main():
                                         for item in incorrect_answers:
                                             try:
                                                 idx = item.get('index', 0)
-                                                card = item.get('card', {})
-                                                user_ans = item.get('user_answer', '')
-                                                similarity = item.get('similarity', 0)
+                                                mcq = item.get('mcq', {})
+                                                selected_option = item.get('selected_option', None)
                                                 
-                                                question = card.get('question', 'No question')[:60]
+                                                question = mcq.get('question', 'No question')[:60]
+                                                options = mcq.get('options', {})
+                                                correct_option = mcq.get('correct_answer', '')
+                                                
                                                 with st.expander(
-                                                    f"❌ Question {idx + 1}: {question}... (Similarity: {similarity:.1%})",
+                                                    f"❌ Question {idx + 1}: {question}...",
                                                     expanded=True
                                                 ):
                                                     st.markdown("**❓ Question:**")
-                                                    st.info(card.get('question', 'N/A'))
+                                                    st.info(mcq.get('question', 'N/A'))
                                                     
-                                                    st.markdown("**✍️ Your Answer:**")
-                                                    st.warning(user_ans if user_ans else "No answer provided")
+                                                    st.markdown("**📋 Options:**")
+                                                    for opt in ["A", "B", "C", "D"]:
+                                                        option_text = options.get(opt, '')
+                                                        if opt == correct_option:
+                                                            st.success(f"**{opt}.** {option_text} ✅ (Correct)")
+                                                        elif opt == selected_option:
+                                                            st.error(f"**{opt}.** {option_text} ❌ (Your Answer)")
+                                                        else:
+                                                            st.write(f"**{opt}.** {option_text}")
                                                     
-                                                    st.markdown("**✅ Correct Answer:**")
-                                                    st.success(card.get('answer', 'N/A'))
-                                                    
-                                                    if similarity > 0:
-                                                        st.caption(
-                                                            f"Similarity Score: {similarity:.1%} - "
-                                                            "Your answer was close but needs more detail."
-                                                        )
+                                                    # Show message if question was unanswered
+                                                    if selected_option is None:
+                                                        st.warning("⚠️ This question was not answered.")
                                             except Exception:
                                                 continue
                                     else:
@@ -932,31 +1235,40 @@ def main():
                                     
                                     # Show all answers summary
                                     st.subheader("📋 Complete Answer Review")
-                                    for idx, card in enumerate(st.session_state.quiz_flashcards):
+                                    for idx in range(total):
                                         try:
-                                            user_ans = st.session_state.quiz_answers.get(idx, "")
+                                            if idx not in st.session_state.quiz_mcq_questions:
+                                                continue
+                                            
+                                            mcq = st.session_state.quiz_mcq_questions[idx]
+                                            selected_option = st.session_state.quiz_answers.get(idx, None)
                                             score_info = st.session_state.quiz_scores.get(idx, {})
                                             is_correct = score_info.get('is_correct', False)
                                             
                                             status_icon = "✅" if is_correct else "❌"
-                                            similarity = score_info.get('similarity', 0)
-                                            similarity_text = f" (Similarity: {similarity:.1%})" if score_info else ""
+                                            question = mcq.get('question', 'No question')[:50]
+                                            options = mcq.get('options', {})
+                                            correct_option = mcq.get('correct_answer', '')
                                             
-                                            question = card.get('question', 'No question')[:50]
                                             with st.expander(
-                                                f"{status_icon} Question {idx + 1}: {question}...{similarity_text}"
+                                                f"{status_icon} Question {idx + 1}: {question}..."
                                             ):
                                                 st.markdown("**Question:**")
-                                                st.write(card.get('question', 'N/A'))
+                                                st.write(mcq.get('question', 'N/A'))
                                                 
-                                                st.markdown("**Your Answer:**")
-                                                st.write(user_ans if user_ans else "No answer provided")
+                                                st.markdown("**Options:**")
+                                                for opt in ["A", "B", "C", "D"]:
+                                                    option_text = options.get(opt, '')
+                                                    if opt == correct_option:
+                                                        st.success(f"**{opt}.** {option_text} ✅ (Correct Answer)")
+                                                    elif opt == selected_option:
+                                                        st.warning(f"**{opt}.** {option_text} (Your Answer)")
+                                                    else:
+                                                        st.write(f"**{opt}.** {option_text}")
                                                 
-                                                st.markdown("**Correct Answer:**")
-                                                st.write(card.get('answer', 'N/A'))
-                                                
-                                                if score_info:
-                                                    st.caption(f"Similarity: {score_info.get('similarity', 0):.1%}")
+                                                # Show message if question was unanswered
+                                                if selected_option is None:
+                                                    st.warning("⚠️ This question was not answered.")
                                         except Exception:
                                             continue
                                     
@@ -967,10 +1279,12 @@ def main():
                                             try:
                                                 st.session_state.quiz_mode = False
                                                 st.session_state.quiz_flashcards = []
+                                                st.session_state.quiz_mcq_questions = {}
                                                 st.session_state.current_quiz_index = 0
                                                 st.session_state.quiz_answers = {}
                                                 st.session_state.quiz_scores = {}
                                                 st.session_state.quiz_completed = False
+                                                st.session_state.quiz_submitted = False
                                                 st.rerun()
                                             except Exception as e:
                                                 st.error(f"Error resetting quiz: {str(e)}")
