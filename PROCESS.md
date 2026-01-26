@@ -135,11 +135,21 @@ Estimated **6–8 hours saved** by using Cursor compared to writing the applicat
 This project demonstrates effective use of AI as a development partner, emphasizing clear communication, iterative prompting, robust error handling, and responsible management of sensitive credentials.
 
 ## Screenshots of AI Interactions and the Process
+Screenshot_prompt_app_skeleton:
 <img width="2082" height="1402" alt="Screenshot_prompt_app_skeleton" src="https://github.com/user-attachments/assets/45e3ca26-7d03-4407-8f20-a4b7f6349e92" />
+
+Screenshot_UI Updates:
 <img width="2016" height="1068" alt="Screenshot_UI Updates" src="https://github.com/user-attachments/assets/1c63e2fb-5aab-4ccc-b584-c03f8f6b7c98" />
+
+Screenshot_Error Handling:
 <img width="2074" height="680" alt="Screenshot_Error Handling" src="https://github.com/user-attachments/assets/df6aec99-c23a-49a5-84b5-265de55bb2c6" />
+
+Screenshot_Bug Fixes:
 <img width="2018" height="1098" alt="Screenshot_Bug Fixes" src="https://github.com/user-attachments/assets/e350ef30-943b-4cc8-a5b8-852976301d93" />
+
+Screenshot_AI Generated Code:
 <img width="1882" height="1416" alt="Screenshot_AI Generated Code" src="https://github.com/user-attachments/assets/c18bcb7a-7273-4b34-bdf3-42247431b172" />
+
 
 
 
