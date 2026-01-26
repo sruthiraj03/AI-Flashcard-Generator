@@ -45,3 +45,17 @@ This project demonstrates effective use of **prompt-driven AI development**, rob
 - This application is designed to be **simple, reliable, and production-ready**.
 - Emphasis is placed on usability, deterministic scoring, and clean user experience.
 - The project meets coursework requirements for an AI-assisted, end-to-end functional application.
+
+## Screenshots of App Features
+### Main Navigation and Flashcard Generator Page
+<img width="2758" height="1454" alt="image" src="https://github.com/user-attachments/assets/74562ef9-c5cc-4aa8-a3de-9dc20defb5e1" />
+
+### Generated Flashcards
+<img width="1995" height="952" alt="image" src="https://github.com/user-attachments/assets/45ea8b69-7e6b-4917-8e63-7f4574aa9d04" />
+
+### Review Flashcards page
+<img width="1995" height="1280" alt="image" src="https://github.com/user-attachments/assets/c95d0f85-d50a-4397-bc39-830a770b3208" />
+
+### Quiz Mode Feature
+<img width="2072" height="1305" alt="image" src="https://github.com/user-attachments/assets/07be81d9-919c-4c06-984c-c1b1b74aa9b3" />
+
