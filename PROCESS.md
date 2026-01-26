@@ -42,6 +42,45 @@ Cursor was used for the majority of code generation, refactoring, error handling
 ### Prompt 6 — OpenAI Quota Error Handling
 > Update the flashcard generation logic so that if the OpenAI API returns a quota or rate-limit error (HTTP 429), the app displays a user-friendly warning and falls back to a local mock flashcard generator to ensure the application remains fully functional.
 
+### Prompt 7 — API Failure Error Handling
+> If you are unable to generate a response due to connection issues, API errors,
+rate limits, or any internal failure, DO NOT return an error message or stack trace.
+
+### Prompt 8 — Enhancing Quiz Features
+> You are generating quiz questions from study flashcards.
+
+For each flashcard:
+- Convert the question into a multiple-choice question
+- Provide exactly 4 answer options (A, B, C, D)
+- Ensure only ONE option is correct
+- The incorrect options should be plausible but clearly wrong
+- Clearly indicate the correct answer
+
+Return the output in structured JSON format.
+Do NOT include explanations, similarity scores, or free-text grading.
+Do NOT require user-typed answers.
+Each question must be objectively scorable.
+
+### Prompt 9 — User-Friendly Generation Failure Response
+In Quiz Mode, do NOT pre-select any answer choice by default.
+
+Implementation requirement:
+- Each multiple-choice question must start with no selected option (unanswered state).
+- The user must actively select an option before it counts.
+
+If using Streamlit radio/select widgets:
+- Set the default selection to None (no index pre-selected).
+- Track selected answers in session state, but initialize each question’s selection as None.
+- Ensure the UI does not show any option highlighted until the user clicks one.
+ 
+Instead:
+- Return a polite, user-friendly fallback response
+- Explain that flashcards cannot be generated at the moment
+- Suggest the user try again later or edit their input
+- Do NOT mention technical details, APIs, or internal errors
+
+The response should be calm, concise, and non-technical. 
+
 ## Challenges Encountered and Solutions
 
 ### 1. JSON Parsing Errors from LLM Output
